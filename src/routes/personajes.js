@@ -1,6 +1,6 @@
 const router = require('express').Router();
 const db = require('../db');
-const { asyncH, puedeAccederGrupo } = require('../utils');
+const { asyncH, puedeAccederGrupo, registrar } = require('../utils');
 const { verificarToken, soloAdmin } = require('../middleware/auth');
 const tokenOpcional = require('../middleware/tokenOpcional');
 
@@ -9,11 +9,12 @@ const IMAGENES = `COALESCE((SELECT json_agg(i.url ORDER BY i.orden, i.id)
 
 async function cargarPersonaje(id) {
   const { rows } = await db.query(
-    `SELECT p.*, u.nombre AS universo_origen, j.nombre AS jugador, ${IMAGENES}
+    `SELECT p.*, u.nombre AS universo_origen, j.nombre AS jugador, g.nombre AS grupo, ${IMAGENES}
      FROM personaje p
      JOIN universo_origen u ON u.id = p.id_universo_origen
      JOIN usuario j ON j.id = p.id_jugador
-     WHERE p.id = $1`,
+     JOIN grupo_rol g ON g.id = p.id_grupo AND g.eliminado_en IS NULL
+     WHERE p.id = $1 AND p.eliminado_en IS NULL`,
     [id]
   );
   return rows[0];
@@ -75,7 +76,7 @@ router.get('/pendientes', verificarToken, soloAdmin, asyncH(async (req, res) => 
      JOIN grupo_rol g ON g.id = p.id_grupo
      JOIN universo_origen u ON u.id = p.id_universo_origen
      JOIN usuario j ON j.id = p.id_jugador
-     WHERE p.estado = 'pendiente'
+     WHERE p.estado = 'pendiente' AND p.eliminado_en IS NULL AND g.eliminado_en IS NULL
      ORDER BY p.id`
   );
   res.json(rows);
@@ -100,6 +101,8 @@ router.post('/', verificarToken, asyncH(async (req, res) => {
   if (!(await puedeAccederGrupo(req.usuario, idGrupo))) {
     return res.status(403).json({ error: 'No perteneces a este grupo' });
   }
+  const g = await db.query('SELECT nombre FROM grupo_rol WHERE id = $1 AND eliminado_en IS NULL', [idGrupo]);
+  if (!g.rows[0]) return res.status(404).json({ error: 'Grupo no encontrado' });
   const v = validarImagenes(imagenes);
   if (v.error) return res.status(400).json({ error: v.error });
 
@@ -125,6 +128,8 @@ router.post('/', verificarToken, asyncH(async (req, res) => {
     if (v.urls && v.urls.length) await guardarImagenes(client, rows[0].id, v.urls);
     return rows[0].id;
   });
+  await registrar(req.usuario.id, 'personaje.crear',
+    `Creó el personaje "${nombre}" en el grupo "${g.rows[0].nombre}"` + (req.usuario.es_administrador ? '' : ' (pendiente de aprobación)'));
   res.status(201).json(await cargarPersonaje(id));
 }));
 
@@ -166,28 +171,30 @@ router.put('/:id', verificarToken, asyncH(async (req, res) => {
     );
     if (v.urls !== undefined) await guardarImagenes(client, p.id, v.urls);
   });
+  const nj = nuevoJugador ? (await db.query('SELECT nombre FROM usuario WHERE id = $1', [nuevoJugador])).rows[0] : null;
+  await registrar(req.usuario.id, 'personaje.editar',
+    `Editó el personaje "${p.nombre}" del grupo "${p.grupo}"` + (nj ? ` y lo asignó a ${nj.nombre}` : ''));
   res.json(await cargarPersonaje(p.id));
 }));
 
 // PUT /api/personajes/:id/aprobar (solo administrador)
 router.put('/:id/aprobar', verificarToken, soloAdmin, asyncH(async (req, res) => {
-  const { rowCount } = await db.query(
-    "UPDATE personaje SET estado = 'aprobado', motivo_rechazo = NULL WHERE id = $1",
-    [Number(req.params.id)]
-  );
-  if (!rowCount) return res.status(404).json({ error: 'Personaje no encontrado' });
-  res.json(await cargarPersonaje(Number(req.params.id)));
+  const p = await cargarPersonaje(Number(req.params.id));
+  if (!p) return res.status(404).json({ error: 'Personaje no encontrado' });
+  await db.query("UPDATE personaje SET estado = 'aprobado', motivo_rechazo = NULL WHERE id = $1", [p.id]);
+  await registrar(req.usuario.id, 'personaje.aprobar', `Aprobó el personaje "${p.nombre}" de ${p.jugador} en el grupo "${p.grupo}"`);
+  res.json(await cargarPersonaje(p.id));
 }));
 
 // PUT /api/personajes/:id/rechazar (solo administrador) body: { motivo }
 router.put('/:id/rechazar', verificarToken, soloAdmin, asyncH(async (req, res) => {
+  const p = await cargarPersonaje(Number(req.params.id));
+  if (!p) return res.status(404).json({ error: 'Personaje no encontrado' });
   const motivo = (req.body.motivo || '').trim() || null;
-  const { rowCount } = await db.query(
-    "UPDATE personaje SET estado = 'rechazado', motivo_rechazo = $2 WHERE id = $1",
-    [Number(req.params.id), motivo]
-  );
-  if (!rowCount) return res.status(404).json({ error: 'Personaje no encontrado' });
-  res.json(await cargarPersonaje(Number(req.params.id)));
+  await db.query("UPDATE personaje SET estado = 'rechazado', motivo_rechazo = $2 WHERE id = $1", [p.id, motivo]);
+  await registrar(req.usuario.id, 'personaje.rechazar',
+    `Rechazó el personaje "${p.nombre}" de ${p.jugador} en el grupo "${p.grupo}"` + (motivo ? `. Motivo: ${motivo}` : ''));
+  res.json(await cargarPersonaje(p.id));
 }));
 
 // DELETE /api/personajes/:id
@@ -197,7 +204,8 @@ router.delete('/:id', verificarToken, asyncH(async (req, res) => {
   if (!(req.usuario.es_administrador || p.id_jugador === req.usuario.id)) {
     return res.status(403).json({ error: 'Solo el jugador dueno o un administrador pueden eliminarlo' });
   }
-  await db.query('DELETE FROM personaje WHERE id = $1', [p.id]);
+  await db.query('UPDATE personaje SET eliminado_en = NOW() WHERE id = $1', [p.id]);
+  await registrar(req.usuario.id, 'personaje.eliminar', `Envió a la papelera el personaje "${p.nombre}" del grupo "${p.grupo}"`);
   res.status(204).end();
 }));
 

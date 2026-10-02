@@ -13,4 +13,16 @@ async function puedeAccederGrupo(usuario, idGrupo) {
   return rowCount > 0;
 }
 
-module.exports = { asyncH, puedeAccederGrupo };
+// Guarda una accion en el historial (si falla, no rompe la operacion principal)
+async function registrar(idUsuario, accion, descripcion) {
+  try {
+    await db.query(
+      'INSERT INTO historial (id_usuario, accion, descripcion) VALUES ($1, $2, $3)',
+      [idUsuario, accion, descripcion]
+    );
+  } catch (e) {
+    console.error('No se pudo guardar en el historial:', e.message);
+  }
+}
+
+module.exports = { asyncH, puedeAccederGrupo, registrar };

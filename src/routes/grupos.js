@@ -1,12 +1,22 @@
 const router = require('express').Router();
 const db = require('../db');
-const { asyncH, puedeAccederGrupo } = require('../utils');
+const { asyncH, puedeAccederGrupo, registrar } = require('../utils');
 const { verificarToken, soloAdmin } = require('../middleware/auth');
 const tokenOpcional = require('../middleware/tokenOpcional');
 
+// Nombres del usuario y del grupo para el historial
+async function nombres(idUsuario, idGrupo) {
+  const { rows } = await db.query(
+    `SELECT (SELECT nombre FROM usuario WHERE id = $1) AS usuario,
+            (SELECT nombre FROM grupo_rol WHERE id = $2) AS grupo`,
+    [idUsuario, idGrupo]
+  );
+  return rows[0];
+}
+
 // GET /api/grupos (publico)
 router.get('/', asyncH(async (req, res) => {
-  const { rows } = await db.query('SELECT * FROM grupo_rol ORDER BY nombre');
+  const { rows } = await db.query('SELECT * FROM grupo_rol WHERE eliminado_en IS NULL ORDER BY nombre');
   res.json(rows);
 }));
 
@@ -18,6 +28,7 @@ router.post('/', verificarToken, soloAdmin, asyncH(async (req, res) => {
     'INSERT INTO grupo_rol (nombre, descripcion, id_creador) VALUES ($1, $2, $3) RETURNING *',
     [nombre, descripcion || null, req.usuario.id]
   );
+  await registrar(req.usuario.id, 'grupo.crear', `Creó el grupo "${rows[0].nombre}"`);
   res.status(201).json(rows[0]);
 }));
 
@@ -29,39 +40,29 @@ router.put('/:id', verificarToken, soloAdmin, asyncH(async (req, res) => {
   }
   const { rows } = await db.query(
     `UPDATE grupo_rol SET nombre = COALESCE($1, nombre), descripcion = COALESCE($2, descripcion)
-     WHERE id = $3 RETURNING *`,
+     WHERE id = $3 AND eliminado_en IS NULL RETURNING *`,
     [nombre === undefined ? null : String(nombre).trim(), descripcion, Number(req.params.id)]
   );
   if (!rows[0]) return res.status(404).json({ error: 'Grupo no encontrado' });
+  await registrar(req.usuario.id, 'grupo.editar', `Editó el grupo "${rows[0].nombre}"`);
   res.json(rows[0]);
 }));
 
-// DELETE /api/grupos/:id (solo administrador) -> borra el grupo y todos sus personajes
+// DELETE /api/grupos/:id (solo administrador) -> lo envia a la papelera (se puede restaurar)
 router.delete('/:id', verificarToken, soloAdmin, asyncH(async (req, res) => {
-  const id = Number(req.params.id);
-  const client = await db.connect();
-  try {
-    await client.query('BEGIN');
-    await client.query('DELETE FROM personaje WHERE id_grupo = $1', [id]);
-    const { rowCount } = await client.query('DELETE FROM grupo_rol WHERE id = $1', [id]);
-    if (!rowCount) {
-      await client.query('ROLLBACK');
-      return res.status(404).json({ error: 'Grupo no encontrado' });
-    }
-    await client.query('COMMIT');
-    res.status(204).end();
-  } catch (e) {
-    await client.query('ROLLBACK');
-    throw e;
-  } finally {
-    client.release();
-  }
+  const { rows } = await db.query(
+    'UPDATE grupo_rol SET eliminado_en = NOW() WHERE id = $1 AND eliminado_en IS NULL RETURNING nombre',
+    [Number(req.params.id)]
+  );
+  if (!rows[0]) return res.status(404).json({ error: 'Grupo no encontrado' });
+  await registrar(req.usuario.id, 'grupo.eliminar', `Envió a la papelera el grupo "${rows[0].nombre}"`);
+  res.status(204).end();
 }));
 
 // GET /api/grupos/:id (publico) -> grupo + personajes con sus imagenes
 router.get('/:id', tokenOpcional, asyncH(async (req, res) => {
   const idGrupo = Number(req.params.id);
-  const grupo = await db.query('SELECT * FROM grupo_rol WHERE id = $1', [idGrupo]);
+  const grupo = await db.query('SELECT * FROM grupo_rol WHERE id = $1 AND eliminado_en IS NULL', [idGrupo]);
   if (!grupo.rows[0]) return res.status(404).json({ error: 'Grupo no encontrado' });
 
   // Visitantes: solo aprobados. Jugador: aprobados + los suyos. Administrador: todos.
@@ -79,7 +80,7 @@ router.get('/:id', tokenOpcional, asyncH(async (req, res) => {
      FROM personaje p
      JOIN universo_origen u ON u.id = p.id_universo_origen
      JOIN usuario j ON j.id = p.id_jugador
-     WHERE p.id_grupo = $1 AND ${cond}
+     WHERE p.id_grupo = $1 AND p.eliminado_en IS NULL AND ${cond}
      ORDER BY p.nombre`,
     params
   );
@@ -110,6 +111,8 @@ router.post('/:id/miembros', verificarToken, soloAdmin, asyncH(async (req, res) 
      VALUES ($1, $2, $3) RETURNING *`,
     [id_usuario, Number(req.params.id), req.usuario.id]
   );
+  const n = await nombres(id_usuario, Number(req.params.id));
+  await registrar(req.usuario.id, 'miembro.agregar', `Agregó a ${n.usuario} al grupo "${n.grupo}"`);
   res.status(201).json(rows[0]);
 }));
 
@@ -120,6 +123,8 @@ router.delete('/:id/miembros/:idUsuario', verificarToken, soloAdmin, asyncH(asyn
     [Number(req.params.id), Number(req.params.idUsuario)]
   );
   if (!rowCount) return res.status(404).json({ error: 'Miembro no encontrado' });
+  const n = await nombres(Number(req.params.idUsuario), Number(req.params.id));
+  await registrar(req.usuario.id, 'miembro.quitar', `Quitó a ${n.usuario} del grupo "${n.grupo}"`);
   res.status(204).end();
 }));
 
