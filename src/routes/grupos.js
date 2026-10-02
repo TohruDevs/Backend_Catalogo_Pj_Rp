@@ -21,6 +21,43 @@ router.post('/', verificarToken, soloAdmin, asyncH(async (req, res) => {
   res.status(201).json(rows[0]);
 }));
 
+// PUT /api/grupos/:id (solo administrador) body: { nombre, descripcion }
+router.put('/:id', verificarToken, soloAdmin, asyncH(async (req, res) => {
+  const { nombre, descripcion } = req.body;
+  if (nombre !== undefined && !String(nombre).trim()) {
+    return res.status(400).json({ error: 'El nombre no puede estar vacio' });
+  }
+  const { rows } = await db.query(
+    `UPDATE grupo_rol SET nombre = COALESCE($1, nombre), descripcion = COALESCE($2, descripcion)
+     WHERE id = $3 RETURNING *`,
+    [nombre === undefined ? null : String(nombre).trim(), descripcion, Number(req.params.id)]
+  );
+  if (!rows[0]) return res.status(404).json({ error: 'Grupo no encontrado' });
+  res.json(rows[0]);
+}));
+
+// DELETE /api/grupos/:id (solo administrador) -> borra el grupo y todos sus personajes
+router.delete('/:id', verificarToken, soloAdmin, asyncH(async (req, res) => {
+  const id = Number(req.params.id);
+  const client = await db.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query('DELETE FROM personaje WHERE id_grupo = $1', [id]);
+    const { rowCount } = await client.query('DELETE FROM grupo_rol WHERE id = $1', [id]);
+    if (!rowCount) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Grupo no encontrado' });
+    }
+    await client.query('COMMIT');
+    res.status(204).end();
+  } catch (e) {
+    await client.query('ROLLBACK');
+    throw e;
+  } finally {
+    client.release();
+  }
+}));
+
 // GET /api/grupos/:id (publico) -> grupo + personajes con sus imagenes
 router.get('/:id', tokenOpcional, asyncH(async (req, res) => {
   const idGrupo = Number(req.params.id);
