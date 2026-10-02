@@ -70,7 +70,7 @@ const esMiembro = (idUsuario, idGrupo) =>
 // GET /api/personajes/pendientes (solo administrador) -> solicitudes por aprobar
 router.get('/pendientes', verificarToken, soloAdmin, asyncH(async (req, res) => {
   const { rows } = await db.query(
-    `SELECT p.id, p.nombre, p.descripcion, p.id_grupo, g.nombre AS grupo,
+    `SELECT p.id, p.nombre, p.descripcion, p.id_grupo, p.solicita_ingreso, g.nombre AS grupo,
             u.nombre AS universo_origen, j.nombre AS jugador, ${IMAGENES}
      FROM personaje p
      JOIN grupo_rol g ON g.id = p.id_grupo
@@ -98,9 +98,8 @@ router.post('/', verificarToken, asyncH(async (req, res) => {
     return res.status(400).json({ error: 'nombre, id_universo_origen e id_grupo son obligatorios' });
   }
   const idGrupo = Number(id_grupo);
-  if (!(await puedeAccederGrupo(req.usuario, idGrupo))) {
-    return res.status(403).json({ error: 'No perteneces a este grupo' });
-  }
+  // Quien no es miembro tambien puede crear: el personaje se envia junto con la solicitud para unirse al grupo
+  const solicitaIngreso = !(await puedeAccederGrupo(req.usuario, idGrupo));
   const g = await db.query('SELECT nombre FROM grupo_rol WHERE id = $1 AND eliminado_en IS NULL', [idGrupo]);
   if (!g.rows[0]) return res.status(404).json({ error: 'Grupo no encontrado' });
   const v = validarImagenes(imagenes);
@@ -119,17 +118,17 @@ router.post('/', verificarToken, asyncH(async (req, res) => {
 
   const id = await conTransaccion(async (client) => {
     const { rows } = await client.query(
-      `INSERT INTO personaje (nombre, descripcion, id_jugador, id_universo_origen, id_grupo, estado)
-       VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`,
+      `INSERT INTO personaje (nombre, descripcion, id_jugador, id_universo_origen, id_grupo, estado, solicita_ingreso)
+       VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id`,
       // Un administrador publica directo; un jugador queda pendiente de aprobacion
       [nombre, descripcion || null, jugador, id_universo_origen, idGrupo,
-       req.usuario.es_administrador ? 'aprobado' : 'pendiente']
+       req.usuario.es_administrador ? 'aprobado' : 'pendiente', solicitaIngreso]
     );
     if (v.urls && v.urls.length) await guardarImagenes(client, rows[0].id, v.urls);
     return rows[0].id;
   });
   await registrar(req.usuario.id, 'personaje.crear',
-    `Creó el personaje "${nombre}" en el grupo "${g.rows[0].nombre}"` + (req.usuario.es_administrador ? '' : ' (pendiente de aprobación)'));
+    `Creó el personaje "${nombre}" en el grupo "${g.rows[0].nombre}"` + (req.usuario.es_administrador ? '' : solicitaIngreso ? ' (pendiente de aprobación y solicita unirse al grupo)' : ' (pendiente de aprobación)'));
   res.status(201).json(await cargarPersonaje(id));
 }));
 
@@ -163,7 +162,9 @@ router.put('/:id', verificarToken, asyncH(async (req, res) => {
          id_universo_origen = COALESCE($3, id_universo_origen),
          id_jugador = COALESCE($4, id_jugador),
          estado = COALESCE($6::varchar, estado),
-         motivo_rechazo = CASE WHEN $6::varchar IS NULL THEN motivo_rechazo ELSE NULL END
+         motivo_rechazo = CASE WHEN $6::varchar IS NULL THEN motivo_rechazo ELSE NULL END,
+         solicita_ingreso = CASE WHEN $6::varchar IS NULL THEN solicita_ingreso ELSE NOT EXISTS (
+           SELECT 1 FROM miembro_grupo m WHERE m.id_usuario = personaje.id_jugador AND m.id_grupo = personaje.id_grupo) END
        WHERE id = $5`,
       // Si edita un jugador (no administrador), vuelve a quedar pendiente de aprobacion
       [nombre, descripcion, id_universo_origen, nuevoJugador, p.id,
@@ -181,8 +182,19 @@ router.put('/:id', verificarToken, asyncH(async (req, res) => {
 router.put('/:id/aprobar', verificarToken, soloAdmin, asyncH(async (req, res) => {
   const p = await cargarPersonaje(Number(req.params.id));
   if (!p) return res.status(404).json({ error: 'Personaje no encontrado' });
-  await db.query("UPDATE personaje SET estado = 'aprobado', motivo_rechazo = NULL WHERE id = $1", [p.id]);
+  await db.query("UPDATE personaje SET estado = 'aprobado', motivo_rechazo = NULL, solicita_ingreso = FALSE WHERE id = $1", [p.id]);
   await registrar(req.usuario.id, 'personaje.aprobar', `Aprobó el personaje "${p.nombre}" de ${p.jugador} en el grupo "${p.grupo}"`);
+  // Si venia con solicitud para unirse al grupo, al aprobarlo el jugador pasa a ser miembro
+  if (p.solicita_ingreso) {
+    const { rowCount } = await db.query(
+      `INSERT INTO miembro_grupo (id_usuario, id_grupo, agregado_por) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING`,
+      [p.id_jugador, p.id_grupo, req.usuario.id]
+    );
+    if (rowCount) {
+      await registrar(req.usuario.id, 'miembro.agregar',
+        `Agregó a ${p.jugador} al grupo "${p.grupo}" (solicitud enviada junto con su personaje)`);
+    }
+  }
   res.json(await cargarPersonaje(p.id));
 }));
 

@@ -5,11 +5,11 @@ const { verificarToken, soloAdmin } = require('../middleware/auth');
 
 router.use(verificarToken, soloAdmin);
 
-// GET /api/historial?tipo=grupo|personaje|miembro&antes=ID&limite=50
+// GET /api/historial?tipo=grupo|personaje|miembro|usuario&antes=ID&limite=50
 router.get('/', asyncH(async (req, res) => {
   const limite = Math.min(Number(req.query.limite) || 50, 200);
   const antes = req.query.antes ? Number(req.query.antes) : null;
-  const tipo = ['grupo', 'personaje', 'miembro'].includes(req.query.tipo) ? req.query.tipo : null;
+  const tipo = ['grupo', 'personaje', 'miembro', 'usuario'].includes(req.query.tipo) ? req.query.tipo : null;
   const { rows } = await db.query(
     `SELECT h.id, h.accion, h.descripcion, h.fecha, u.nombre AS usuario
      FROM historial h LEFT JOIN usuario u ON u.id = h.id_usuario
