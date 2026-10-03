@@ -1,6 +1,6 @@
 const router = require('express').Router();
 const db = require('../db');
-const { asyncH, puedeAccederGrupo, registrar } = require('../utils');
+const { asyncH, puedeAccederGrupo, puedeModerar, registrar } = require('../utils');
 const { verificarToken, soloAdmin } = require('../middleware/auth');
 const tokenOpcional = require('../middleware/tokenOpcional');
 
@@ -17,6 +17,16 @@ async function nombres(idUsuario, idGrupo) {
 // GET /api/grupos (publico)
 router.get('/', asyncH(async (req, res) => {
   const { rows } = await db.query('SELECT * FROM grupo_rol WHERE eliminado_en IS NULL ORDER BY nombre');
+  res.json(rows);
+}));
+
+// GET /api/grupos/moderados (con sesion) -> grupos donde el usuario es moderador
+router.get('/moderados', verificarToken, asyncH(async (req, res) => {
+  const { rows } = await db.query(
+    `SELECT g.id, g.nombre FROM miembro_grupo m JOIN grupo_rol g ON g.id = m.id_grupo
+     WHERE m.id_usuario = $1 AND m.rol = 'moderador' AND g.eliminado_en IS NULL ORDER BY g.nombre`,
+    [req.usuario.id]
+  );
   res.json(rows);
 }));
 
@@ -68,7 +78,8 @@ router.get('/:id', tokenOpcional, asyncH(async (req, res) => {
   // Visitantes: solo aprobados. Jugador: aprobados + los suyos. Administrador: todos.
   let cond = "p.estado = 'aprobado'";
   const params = [idGrupo];
-  if (req.usuario && req.usuario.es_administrador) cond = 'TRUE';
+  const puedeMod = req.usuario ? await puedeModerar(req.usuario, idGrupo) : false;
+  if (puedeMod) cond = 'TRUE';
   else if (req.usuario) { cond = "(p.estado = 'aprobado' OR p.id_jugador = $2)"; params.push(req.usuario.id); }
 
   const personajes = await db.query(
@@ -84,7 +95,7 @@ router.get('/:id', tokenOpcional, asyncH(async (req, res) => {
      ORDER BY p.nombre`,
     params
   );
-  res.json({ ...grupo.rows[0], personajes: personajes.rows });
+  res.json({ ...grupo.rows[0], puede_moderar: puedeMod, personajes: personajes.rows });
 }));
 
 // GET /api/grupos/:id/miembros (miembros del grupo o administrador; incluye correos)
@@ -94,16 +105,20 @@ router.get('/:id/miembros', verificarToken, asyncH(async (req, res) => {
     return res.status(403).json({ error: 'No perteneces a este grupo' });
   }
   const { rows } = await db.query(
-    `SELECT u.id, u.nombre, u.correo, m.fecha_ingreso
+    `SELECT u.id, u.nombre, u.correo, m.rol, m.fecha_ingreso
      FROM miembro_grupo m JOIN usuario u ON u.id = m.id_usuario
      WHERE m.id_grupo = $1 ORDER BY u.nombre`,
     [idGrupo]
   );
-  res.json(rows);
+  // Solo el administrador ve los correos
+  res.json(req.usuario.es_administrador ? rows : rows.map(({ correo, ...resto }) => resto));
 }));
 
 // POST /api/grupos/:id/miembros (solo administrador) body: { id_usuario }
-router.post('/:id/miembros', verificarToken, soloAdmin, asyncH(async (req, res) => {
+router.post('/:id/miembros', verificarToken, asyncH(async (req, res) => {
+  if (!(await puedeModerar(req.usuario, Number(req.params.id)))) {
+    return res.status(403).json({ error: 'Solo un administrador o un moderador del grupo puede agregar usuarios' });
+  }
   const { id_usuario } = req.body;
   if (!id_usuario) return res.status(400).json({ error: 'id_usuario es obligatorio' });
   const { rows } = await db.query(
@@ -114,6 +129,39 @@ router.post('/:id/miembros', verificarToken, soloAdmin, asyncH(async (req, res) 
   const n = await nombres(id_usuario, Number(req.params.id));
   await registrar(req.usuario.id, 'miembro.agregar', `Agregó a ${n.usuario} al grupo "${n.grupo}"`);
   res.status(201).json(rows[0]);
+}));
+
+// GET /api/grupos/:id/candidatos (administrador o moderador del grupo) -> usuarios que aun no son miembros
+router.get('/:id/candidatos', verificarToken, asyncH(async (req, res) => {
+  const idGrupo = Number(req.params.id);
+  if (!(await puedeModerar(req.usuario, idGrupo))) {
+    return res.status(403).json({ error: 'Solo un administrador o un moderador del grupo puede ver esto' });
+  }
+  const { rows } = await db.query(
+    `SELECT id, nombre FROM usuario
+     WHERE id NOT IN (SELECT id_usuario FROM miembro_grupo WHERE id_grupo = $1) ORDER BY nombre`,
+    [idGrupo]
+  );
+  res.json(rows);
+}));
+
+// PUT /api/grupos/:id/miembros/:idUsuario (solo administrador) body: { rol: 'jugador' | 'moderador' }
+router.put('/:id/miembros/:idUsuario', verificarToken, soloAdmin, asyncH(async (req, res) => {
+  const { rol } = req.body;
+  if (!['jugador', 'moderador'].includes(rol)) {
+    return res.status(400).json({ error: "rol debe ser 'jugador' o 'moderador'" });
+  }
+  const idGrupo = Number(req.params.id), idUsuario = Number(req.params.idUsuario);
+  const { rowCount } = await db.query(
+    'UPDATE miembro_grupo SET rol = $1 WHERE id_grupo = $2 AND id_usuario = $3',
+    [rol, idGrupo, idUsuario]
+  );
+  if (!rowCount) return res.status(404).json({ error: 'Miembro no encontrado' });
+  const n = await nombres(idUsuario, idGrupo);
+  await registrar(req.usuario.id, 'miembro.rol',
+    rol === 'moderador' ? `Nombró moderador a ${n.usuario} en el grupo "${n.grupo}"`
+                        : `Quitó el rol de moderador a ${n.usuario} en el grupo "${n.grupo}"`);
+  res.json({ ok: true });
 }));
 
 // DELETE /api/grupos/:id/miembros/:idUsuario (solo administrador)

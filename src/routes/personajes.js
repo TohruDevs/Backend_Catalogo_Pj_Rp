@@ -1,6 +1,6 @@
 const router = require('express').Router();
 const db = require('../db');
-const { asyncH, puedeAccederGrupo, registrar } = require('../utils');
+const { asyncH, puedeAccederGrupo, puedeModerar, registrar } = require('../utils');
 const { verificarToken, soloAdmin } = require('../middleware/auth');
 const tokenOpcional = require('../middleware/tokenOpcional');
 
@@ -67,8 +67,18 @@ async function guardarImagenes(client, idPersonaje, urls) {
 const esMiembro = (idUsuario, idGrupo) =>
   puedeAccederGrupo({ id: idUsuario, es_administrador: false }, idGrupo);
 
-// GET /api/personajes/pendientes (solo administrador) -> solicitudes por aprobar
-router.get('/pendientes', verificarToken, soloAdmin, asyncH(async (req, res) => {
+// Carga el personaje y exige ser administrador o moderador de su grupo
+const moderador = asyncH(async (req, res, next) => {
+  const p = await cargarPersonaje(Number(req.params.id));
+  if (!p) return res.status(404).json({ error: 'Personaje no encontrado' });
+  if (!(await puedeModerar(req.usuario, p.id_grupo))) {
+    return res.status(403).json({ error: 'Solo un administrador o un moderador del grupo puede hacer esto' });
+  }
+  next();
+});
+
+// GET /api/personajes/pendientes -> solicitudes por aprobar (administrador: todas; moderador: las de sus grupos)
+router.get('/pendientes', verificarToken, asyncH(async (req, res) => {
   const { rows } = await db.query(
     `SELECT p.id, p.nombre, p.descripcion, p.id_grupo, p.solicita_ingreso, g.nombre AS grupo,
             u.nombre AS universo_origen, j.nombre AS jugador, ${IMAGENES}
@@ -77,7 +87,10 @@ router.get('/pendientes', verificarToken, soloAdmin, asyncH(async (req, res) => 
      JOIN universo_origen u ON u.id = p.id_universo_origen
      JOIN usuario j ON j.id = p.id_jugador
      WHERE p.estado = 'pendiente' AND p.eliminado_en IS NULL AND g.eliminado_en IS NULL
-     ORDER BY p.id`
+       AND ($1::boolean OR EXISTS (SELECT 1 FROM miembro_grupo m
+            WHERE m.id_usuario = $2 AND m.id_grupo = p.id_grupo AND m.rol = 'moderador'))
+     ORDER BY p.id`,
+    [req.usuario.es_administrador, req.usuario.id]
   );
   res.json(rows);
 }));
@@ -179,7 +192,7 @@ router.put('/:id', verificarToken, asyncH(async (req, res) => {
 }));
 
 // PUT /api/personajes/:id/aprobar (solo administrador)
-router.put('/:id/aprobar', verificarToken, soloAdmin, asyncH(async (req, res) => {
+router.put('/:id/aprobar', verificarToken, moderador, asyncH(async (req, res) => {
   const p = await cargarPersonaje(Number(req.params.id));
   if (!p) return res.status(404).json({ error: 'Personaje no encontrado' });
   await db.query("UPDATE personaje SET estado = 'aprobado', motivo_rechazo = NULL, solicita_ingreso = FALSE WHERE id = $1", [p.id]);
@@ -199,7 +212,7 @@ router.put('/:id/aprobar', verificarToken, soloAdmin, asyncH(async (req, res) =>
 }));
 
 // PUT /api/personajes/:id/rechazar (solo administrador) body: { motivo }
-router.put('/:id/rechazar', verificarToken, soloAdmin, asyncH(async (req, res) => {
+router.put('/:id/rechazar', verificarToken, moderador, asyncH(async (req, res) => {
   const p = await cargarPersonaje(Number(req.params.id));
   if (!p) return res.status(404).json({ error: 'Personaje no encontrado' });
   const motivo = (req.body.motivo || '').trim() || null;

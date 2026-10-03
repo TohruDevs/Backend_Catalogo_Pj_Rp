@@ -25,4 +25,14 @@ async function registrar(idUsuario, accion, descripcion) {
   }
 }
 
-module.exports = { asyncH, puedeAccederGrupo, registrar };
+// Administrador, o moderador de ese grupo
+async function puedeModerar(usuario, idGrupo) {
+  if (usuario.es_administrador) return true;
+  const { rowCount } = await db.query(
+    "SELECT 1 FROM miembro_grupo WHERE id_usuario = $1 AND id_grupo = $2 AND rol = 'moderador'",
+    [usuario.id, idGrupo]
+  );
+  return rowCount > 0;
+}
+
+module.exports = { asyncH, puedeAccederGrupo, puedeModerar, registrar };
