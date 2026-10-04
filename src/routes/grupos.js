@@ -105,13 +105,19 @@ router.get('/:id/miembros', verificarToken, asyncH(async (req, res) => {
     return res.status(403).json({ error: 'No perteneces a este grupo' });
   }
   const { rows } = await db.query(
-    `SELECT u.id, u.nombre, u.correo, m.rol, m.fecha_ingreso
+    `SELECT u.id, u.nombre, u.correo, u.es_administrador, m.rol, m.fecha_ingreso
      FROM miembro_grupo m JOIN usuario u ON u.id = m.id_usuario
      WHERE m.id_grupo = $1 ORDER BY u.nombre`,
     [idGrupo]
   );
-  // Solo el administrador ve los correos
-  res.json(req.usuario.es_administrador ? rows : rows.map(({ correo, ...resto }) => resto));
+  // Solo el administrador ve correos y permisos; 'quitable' indica si quien consulta puede quitar a ese miembro
+  const admin = req.usuario.es_administrador;
+  const mod = await puedeModerar(req.usuario, idGrupo);
+  res.json(rows.map(({ correo, es_administrador, ...m }) => ({
+    ...m,
+    ...(admin ? { correo, es_administrador } : {}),
+    quitable: admin || (mod && m.rol === 'jugador' && !es_administrador),
+  })));
 }));
 
 // POST /api/grupos/:id/miembros (solo administrador) body: { id_usuario }
@@ -164,11 +170,25 @@ router.put('/:id/miembros/:idUsuario', verificarToken, soloAdmin, asyncH(async (
   res.json({ ok: true });
 }));
 
-// DELETE /api/grupos/:id/miembros/:idUsuario (solo administrador)
-router.delete('/:id/miembros/:idUsuario', verificarToken, soloAdmin, asyncH(async (req, res) => {
+// DELETE /api/grupos/:id/miembros/:idUsuario (administrador, o moderador del grupo si el miembro es un jugador)
+router.delete('/:id/miembros/:idUsuario', verificarToken, asyncH(async (req, res) => {
+  const idGrupo = Number(req.params.id), idUsuario = Number(req.params.idUsuario);
+  if (!(await puedeModerar(req.usuario, idGrupo))) {
+    return res.status(403).json({ error: 'Solo un administrador o un moderador del grupo puede quitar miembros' });
+  }
+  if (!req.usuario.es_administrador) {
+    const { rows } = await db.query(
+      `SELECT m.rol, u.es_administrador FROM miembro_grupo m JOIN usuario u ON u.id = m.id_usuario
+       WHERE m.id_grupo = $1 AND m.id_usuario = $2`,
+      [idGrupo, idUsuario]
+    );
+    if (rows[0] && (rows[0].rol === 'moderador' || rows[0].es_administrador)) {
+      return res.status(403).json({ error: 'Un moderador no puede quitar a otros moderadores ni a administradores' });
+    }
+  }
   const { rowCount } = await db.query(
     'DELETE FROM miembro_grupo WHERE id_grupo = $1 AND id_usuario = $2',
-    [Number(req.params.id), Number(req.params.idUsuario)]
+    [idGrupo, idUsuario]
   );
   if (!rowCount) return res.status(404).json({ error: 'Miembro no encontrado' });
   const n = await nombres(Number(req.params.idUsuario), Number(req.params.id));
