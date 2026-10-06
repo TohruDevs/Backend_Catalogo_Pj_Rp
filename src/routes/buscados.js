@@ -6,14 +6,15 @@ const { verificarToken } = require('../middleware/auth');
 const IMAGENES = `COALESCE((SELECT json_agg(i.url ORDER BY i.orden, i.id)
                   FROM imagen_buscado i WHERE i.id_buscado = b.id), '[]'::json) AS imagenes`;
 const BASE = `SELECT b.id, b.id_grupo, b.nombre, b.descripcion, b.id_universo_origen, b.creado_en,
-                     u.nombre AS universo_origen, g.nombre AS grupo, ${IMAGENES}
+                     u.nombre AS universo_origen, g.nombre AS grupo, b.id_usuario, usr.nombre AS usuario, ${IMAGENES}
               FROM personaje_buscado b
               JOIN universo_origen u ON u.id = b.id_universo_origen
-              JOIN grupo_rol g ON g.id = b.id_grupo AND g.eliminado_en IS NULL`;
+              JOIN grupo_rol g ON g.id = b.id_grupo AND g.eliminado_en IS NULL
+              LEFT JOIN usuario usr ON usr.id = b.id_usuario`;
 
-// Un personaje buscado "activo" es el que todavia no se ha pasado a un personaje
+// Carga un personaje buscado (con el usuario al que esta asignado, si lo tiene)
 const cargarBuscado = async (id) =>
-  (await db.query(`${BASE} WHERE b.id = $1 AND b.asignado_a IS NULL`, [id])).rows[0];
+  (await db.query(`${BASE} WHERE b.id = $1`, [id])).rows[0];
 
 // Valida la lista de enlaces: maximo 10, solo http(s). undefined = no se envio
 function validarImagenes(lista) {
@@ -59,12 +60,12 @@ async function guardarImagenes(client, idBuscado, urls) {
   }
 }
 
-// GET /api/buscados?grupo=ID (publico) -> personajes buscados de un grupo
+// GET /api/buscados?grupo=ID (publico) -> personajes buscados de un grupo (primero los que no tienen usuario)
 router.get('/', asyncH(async (req, res) => {
   const idGrupo = Number(req.query.grupo);
   if (!Number.isInteger(idGrupo)) return res.status(400).json({ error: 'Falta el parametro grupo' });
   const { rows } = await db.query(
-    `${BASE} WHERE b.id_grupo = $1 AND b.asignado_a IS NULL ORDER BY b.nombre`,
+    `${BASE} WHERE b.id_grupo = $1 ORDER BY (b.id_usuario IS NOT NULL), b.nombre`,
     [idGrupo]
   );
   res.json(rows);
@@ -140,40 +141,33 @@ router.delete('/:id', verificarToken, asyncH(async (req, res) => {
   res.status(204).end();
 }));
 
-// POST /api/buscados/:id/asignar body: { id_personaje }
-// Copia nombre, descripcion, universo e imagenes del buscado a un personaje existente del mismo grupo
+// POST /api/buscados/:id/asignar body: { id_usuario } (null = quitar la asignacion)
+// El personaje buscado se queda en la lista de buscados, asignado a un usuario miembro del grupo
 router.post('/:id/asignar', verificarToken, asyncH(async (req, res) => {
   const b = await cargarBuscado(Number(req.params.id));
   if (!b) return res.status(404).json({ error: 'Personaje buscado no encontrado' });
   if (!(await puedeModerar(req.usuario, b.id_grupo))) {
     return res.status(403).json({ error: 'Solo un administrador o un moderador del grupo puede hacer esto' });
   }
-  const idPersonaje = Number(req.body.id_personaje);
-  const { rows } = await db.query(
-    'SELECT id, nombre FROM personaje WHERE id = $1 AND id_grupo = $2 AND eliminado_en IS NULL',
-    [idPersonaje, b.id_grupo]
+  const idUsuario = req.body.id_usuario == null ? null : Number(req.body.id_usuario);
+  let nombreUsuario = null;
+  if (idUsuario !== null) {
+    const { rows } = await db.query(
+      `SELECT u.nombre FROM miembro_grupo m JOIN usuario u ON u.id = m.id_usuario
+       WHERE m.id_grupo = $1 AND m.id_usuario = $2`,
+      [b.id_grupo, idUsuario]
+    );
+    if (!rows[0]) return res.status(400).json({ error: 'El usuario debe ser miembro del grupo' });
+    nombreUsuario = rows[0].nombre;
+  }
+  await db.query(
+    'UPDATE personaje_buscado SET id_usuario = $1, asignado_en = CASE WHEN $1::int IS NULL THEN NULL ELSE NOW() END WHERE id = $2',
+    [idUsuario, b.id]
   );
-  if (!rows[0]) return res.status(404).json({ error: 'Ese personaje no existe en este grupo' });
-
-  await conTransaccion(async (client) => {
-    await client.query(
-      'UPDATE personaje SET nombre = $1, descripcion = $2, id_universo_origen = $3 WHERE id = $4',
-      [b.nombre, b.descripcion, b.id_universo_origen, idPersonaje]
-    );
-    await client.query('DELETE FROM imagen_personaje WHERE id_personaje = $1', [idPersonaje]);
-    await client.query(
-      `INSERT INTO imagen_personaje (id_personaje, url, orden)
-       SELECT $1, url, orden FROM imagen_buscado WHERE id_buscado = $2`,
-      [idPersonaje, b.id]
-    );
-    await client.query(
-      'UPDATE personaje_buscado SET asignado_a = $1, asignado_en = NOW() WHERE id = $2',
-      [idPersonaje, b.id]
-    );
-  });
-  await registrar(req.usuario.id, 'buscado.asignar',
-    `Pasó los datos del personaje buscado "${b.nombre}" al personaje "${rows[0].nombre}" del grupo "${b.grupo}"`);
-  res.json({ ok: true });
+  await registrar(req.usuario.id, idUsuario ? 'buscado.asignar' : 'buscado.liberar',
+    idUsuario ? `Asignó el personaje buscado "${b.nombre}" a ${nombreUsuario} en el grupo "${b.grupo}"`
+              : `Quitó la asignación del personaje buscado "${b.nombre}" en el grupo "${b.grupo}"`);
+  res.json(await cargarBuscado(b.id));
 }));
 
 module.exports = router;
