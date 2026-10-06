@@ -12,6 +12,7 @@ app.use('/api/grupos', require('./routes/grupos'));
 app.use('/api/usuarios', require('./routes/usuarios'));
 app.use('/api/papelera', require('./routes/papelera'));
 app.use('/api/historial', require('./routes/historial'));
+app.use('/api/buscados', require('./routes/buscados'));
 app.use('/api/universos', require('./routes/universos'));
 app.use('/api/personajes', require('./routes/personajes'));
 
