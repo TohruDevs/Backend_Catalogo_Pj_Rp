@@ -70,7 +70,7 @@ const esMiembro = (idUsuario, idGrupo) =>
 // Carga el personaje y exige ser administrador o moderador de su grupo
 const moderador = asyncH(async (req, res, next) => {
   const p = await cargarPersonaje(Number(req.params.id));
-  if (!p) return res.status(404).json({ error: 'Personaje no encontrado' });
+  if (!p || (p.oculto && !req.usuario.es_administrador)) return res.status(404).json({ error: 'Personaje no encontrado' });
   if (!(await puedeModerar(req.usuario, p.id_grupo))) {
     return res.status(403).json({ error: 'Solo un administrador o un moderador del grupo puede hacer esto' });
   }
@@ -89,6 +89,7 @@ router.get('/pendientes', verificarToken, asyncH(async (req, res) => {
      WHERE p.estado = 'pendiente' AND p.eliminado_en IS NULL AND g.eliminado_en IS NULL
        AND ($1::boolean OR EXISTS (SELECT 1 FROM miembro_grupo m
             WHERE m.id_usuario = $2 AND m.id_grupo = p.id_grupo AND m.rol = 'moderador'))
+       AND ($1::boolean OR NOT p.oculto)
      ORDER BY p.id`,
     [req.usuario.es_administrador, req.usuario.id]
   );
@@ -99,7 +100,8 @@ router.get('/pendientes', verificarToken, asyncH(async (req, res) => {
 router.get('/:id', tokenOpcional, asyncH(async (req, res) => {
   const p = await cargarPersonaje(Number(req.params.id));
   const u = req.usuario;
-  const puedeVer = p && (p.estado === 'aprobado' || (u && (u.es_administrador || u.id === p.id_jugador)));
+  // Un personaje oculto solo lo ve un administrador
+  const puedeVer = p && ((u && u.es_administrador) || (!p.oculto && (p.estado === 'aprobado' || (u && u.id === p.id_jugador))));
   if (!puedeVer) return res.status(404).json({ error: 'Personaje no encontrado' });
   res.json(p);
 }));
@@ -219,6 +221,17 @@ router.put('/:id/rechazar', verificarToken, moderador, asyncH(async (req, res) =
   await db.query("UPDATE personaje SET estado = 'rechazado', motivo_rechazo = $2 WHERE id = $1", [p.id, motivo]);
   await registrar(req.usuario.id, 'personaje.rechazar',
     `Rechazó el personaje "${p.nombre}" de ${p.jugador} en el grupo "${p.grupo}"` + (motivo ? `. Motivo: ${motivo}` : ''));
+  res.json(await cargarPersonaje(p.id));
+}));
+
+// PUT /api/personajes/:id/oculto (solo administrador) body: { oculto: true | false }
+router.put('/:id/oculto', verificarToken, soloAdmin, asyncH(async (req, res) => {
+  if (typeof req.body.oculto !== 'boolean') return res.status(400).json({ error: 'oculto debe ser true o false' });
+  const p = await cargarPersonaje(Number(req.params.id));
+  if (!p) return res.status(404).json({ error: 'Personaje no encontrado' });
+  await db.query('UPDATE personaje SET oculto = $1 WHERE id = $2', [req.body.oculto, p.id]);
+  await registrar(req.usuario.id, req.body.oculto ? 'personaje.ocultar' : 'personaje.mostrar',
+    `${req.body.oculto ? 'Ocultó' : 'Volvió a mostrar'} el personaje "${p.nombre}" del grupo "${p.grupo}"`);
   res.json(await cargarPersonaje(p.id));
 }));
 

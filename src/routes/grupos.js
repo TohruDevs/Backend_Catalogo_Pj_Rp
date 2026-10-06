@@ -81,9 +81,11 @@ router.get('/:id', tokenOpcional, asyncH(async (req, res) => {
   const puedeMod = req.usuario ? await puedeModerar(req.usuario, idGrupo) : false;
   if (puedeMod) cond = 'TRUE';
   else if (req.usuario) { cond = "(p.estado = 'aprobado' OR p.id_jugador = $2)"; params.push(req.usuario.id); }
+  // Los personajes ocultos solo los ve un administrador
+  if (!(req.usuario && req.usuario.es_administrador)) cond = `(${cond}) AND p.oculto = FALSE`;
 
   const personajes = await db.query(
-    `SELECT p.id, p.nombre, p.descripcion, p.estado, p.motivo_rechazo,
+    `SELECT p.id, p.nombre, p.descripcion, p.estado, p.motivo_rechazo, p.oculto,
             u.id AS id_universo_origen, u.nombre AS universo_origen,
             j.id AS id_jugador, j.nombre AS jugador,
             COALESCE((SELECT json_agg(i.url ORDER BY i.orden, i.id)
