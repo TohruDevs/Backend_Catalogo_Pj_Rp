@@ -6,13 +6,12 @@ const { verificarToken } = require('../middleware/auth');
 const IMAGENES = `COALESCE((SELECT json_agg(i.url ORDER BY i.orden, i.id)
                   FROM imagen_buscado i WHERE i.id_buscado = b.id), '[]'::json) AS imagenes`;
 const BASE = `SELECT b.id, b.id_grupo, b.nombre, b.descripcion, b.id_universo_origen, b.creado_en,
-                     u.nombre AS universo_origen, g.nombre AS grupo, b.id_usuario, usr.nombre AS usuario, ${IMAGENES}
+                     u.nombre AS universo_origen, g.nombre AS grupo, ${IMAGENES}
               FROM personaje_buscado b
               JOIN universo_origen u ON u.id = b.id_universo_origen
-              JOIN grupo_rol g ON g.id = b.id_grupo AND g.eliminado_en IS NULL
-              LEFT JOIN usuario usr ON usr.id = b.id_usuario`;
+              JOIN grupo_rol g ON g.id = b.id_grupo AND g.eliminado_en IS NULL`;
 
-// Carga un personaje buscado (con el usuario al que esta asignado, si lo tiene)
+// Carga un personaje buscado
 const cargarBuscado = async (id) =>
   (await db.query(`${BASE} WHERE b.id = $1`, [id])).rows[0];
 
@@ -60,12 +59,12 @@ async function guardarImagenes(client, idBuscado, urls) {
   }
 }
 
-// GET /api/buscados?grupo=ID (publico) -> personajes buscados de un grupo (primero los que no tienen usuario)
+// GET /api/buscados?grupo=ID (publico) -> personajes buscados de un grupo
 router.get('/', asyncH(async (req, res) => {
   const idGrupo = Number(req.query.grupo);
   if (!Number.isInteger(idGrupo)) return res.status(400).json({ error: 'Falta el parametro grupo' });
   const { rows } = await db.query(
-    `${BASE} WHERE b.id_grupo = $1 ORDER BY (b.id_usuario IS NOT NULL), b.nombre`,
+    `${BASE} WHERE b.id_grupo = $1 ORDER BY b.nombre`,
     [idGrupo]
   );
   res.json(rows);
@@ -141,33 +140,40 @@ router.delete('/:id', verificarToken, asyncH(async (req, res) => {
   res.status(204).end();
 }));
 
-// POST /api/buscados/:id/asignar body: { id_usuario } (null = quitar la asignacion)
-// El personaje buscado se queda en la lista de buscados, asignado a un usuario miembro del grupo
+// POST /api/buscados/:id/asignar body: { id_usuario }
+// Crea un personaje de ese usuario con los datos del buscado y lo saca de la lista de buscados
 router.post('/:id/asignar', verificarToken, asyncH(async (req, res) => {
   const b = await cargarBuscado(Number(req.params.id));
   if (!b) return res.status(404).json({ error: 'Personaje buscado no encontrado' });
   if (!(await puedeModerar(req.usuario, b.id_grupo))) {
     return res.status(403).json({ error: 'Solo un administrador o un moderador del grupo puede hacer esto' });
   }
-  const idUsuario = req.body.id_usuario == null ? null : Number(req.body.id_usuario);
-  let nombreUsuario = null;
-  if (idUsuario !== null) {
-    const { rows } = await db.query(
-      `SELECT u.nombre FROM miembro_grupo m JOIN usuario u ON u.id = m.id_usuario
-       WHERE m.id_grupo = $1 AND m.id_usuario = $2`,
-      [b.id_grupo, idUsuario]
-    );
-    if (!rows[0]) return res.status(400).json({ error: 'El usuario debe ser miembro del grupo' });
-    nombreUsuario = rows[0].nombre;
-  }
-  await db.query(
-    'UPDATE personaje_buscado SET id_usuario = $1, asignado_en = CASE WHEN $1::int IS NULL THEN NULL ELSE NOW() END WHERE id = $2',
-    [idUsuario, b.id]
+  const idUsuario = Number(req.body.id_usuario);
+  if (!Number.isInteger(idUsuario)) return res.status(400).json({ error: 'id_usuario es obligatorio' });
+  const { rows } = await db.query(
+    `SELECT u.nombre FROM miembro_grupo m JOIN usuario u ON u.id = m.id_usuario
+     WHERE m.id_grupo = $1 AND m.id_usuario = $2`,
+    [b.id_grupo, idUsuario]
   );
-  await registrar(req.usuario.id, idUsuario ? 'buscado.asignar' : 'buscado.liberar',
-    idUsuario ? `Asignó el personaje buscado "${b.nombre}" a ${nombreUsuario} en el grupo "${b.grupo}"`
-              : `Quitó la asignación del personaje buscado "${b.nombre}" en el grupo "${b.grupo}"`);
-  res.json(await cargarBuscado(b.id));
+  if (!rows[0]) return res.status(400).json({ error: 'El usuario debe ser miembro del grupo' });
+
+  const idPersonaje = await conTransaccion(async (client) => {
+    const nuevo = await client.query(
+      `INSERT INTO personaje (nombre, descripcion, id_jugador, id_universo_origen, id_grupo, estado)
+       VALUES ($1, $2, $3, $4, $5, 'aprobado') RETURNING id`,
+      [b.nombre, b.descripcion, idUsuario, b.id_universo_origen, b.id_grupo]
+    );
+    await client.query(
+      `INSERT INTO imagen_personaje (id_personaje, url, orden)
+       SELECT $1, url, orden FROM imagen_buscado WHERE id_buscado = $2`,
+      [nuevo.rows[0].id, b.id]
+    );
+    await client.query('DELETE FROM personaje_buscado WHERE id = $1', [b.id]);
+    return nuevo.rows[0].id;
+  });
+  await registrar(req.usuario.id, 'buscado.asignar',
+    `Asignó el personaje buscado "${b.nombre}" a ${rows[0].nombre} en el grupo "${b.grupo}": pasó a ser un personaje`);
+  res.json({ ok: true, id_personaje: idPersonaje });
 }));
 
 module.exports = router;
