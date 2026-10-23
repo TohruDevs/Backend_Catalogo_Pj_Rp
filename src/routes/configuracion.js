@@ -4,7 +4,7 @@ const { asyncH, registrar } = require('../utils');
 const { verificarToken, soloAdmin } = require('../middleware/auth');
 
 // Epocas disponibles. Para agregar otra (por ejemplo navidad) se anade aqui y en el frontend
-const EPOCAS = { halloween: 'Halloween', navidad: 'Navidad', genshin: 'Genshin Impact' };
+const EPOCAS = { halloween: 'Halloween', navidad: 'Navidad', genshin: 'Genshin Impact', demonslayer: 'Demon Slayer' };
 
 // GET /api/configuracion (publico) -> { epoca: 'halloween' | null }
 router.get('/', asyncH(async (req, res) => {
